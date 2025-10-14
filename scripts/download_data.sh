@@ -69,6 +69,9 @@ case $NAME in
     mv tiny-imagenet-200/* data/tiny-imagenet
     rm tiny-imagenet-200.zip
     rm -r tiny-imagenet-200
+    curl -L -o ./imagenet-class-index-json.zip  https://www.kaggle.com/api/v1/datasets/download/juliangarratt/imagenet-class-index-json
+    unzip ./imagenet-class-index-json.zip -d data/tiny-imagenet
+    rm ./imagenet-class-index-json.zip
     ;;
   "cub200")
     kaggle_diagnose
