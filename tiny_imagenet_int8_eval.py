@@ -7,6 +7,7 @@ Compare FP32 and INT8 models on Tiny-ImageNet and export GradCAM visuals.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import warnings
 from pathlib import Path
@@ -77,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
+        default=42,
         help="Random seed used for subset selection and shuffling.",
     )
     return parser.parse_args()
@@ -274,27 +275,21 @@ def overlay_heatmap(image: np.ndarray, heatmap: np.ndarray) -> np.ndarray:
 
 def save_gradcam_figure(
     original: np.ndarray,
-    heatmap_fp32: np.ndarray,
-    heatmap_int8: np.ndarray,
-    fp32_title: str,
-    int8_title: str,
+    overlays: List[Tuple[str, np.ndarray]],
     save_path: Path,
 ) -> None:
-    overlay_fp32 = overlay_heatmap(original, heatmap_fp32)
-    overlay_int8 = overlay_heatmap(original, heatmap_int8)
+    cols = 1 + len(overlays)
+    fig, axes = plt.subplots(1, cols, figsize=(cols * 4, 4))
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     axes[0].imshow(original)
     axes[0].set_title("Original")
     axes[0].axis("off")
 
-    axes[1].imshow(overlay_fp32)
-    axes[1].set_title(fp32_title)
-    axes[1].axis("off")
-
-    axes[2].imshow(overlay_int8)
-    axes[2].set_title(int8_title)
-    axes[2].axis("off")
+    for idx, (title, heatmap) in enumerate(overlays, start=1):
+        overlay_img = overlay_heatmap(original, heatmap)
+        axes[idx].imshow(overlay_img)
+        axes[idx].set_title(title)
+        axes[idx].axis("off")
 
     plt.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +309,10 @@ def generate_gradcam_samples(
     results_dir: Path,
     num_samples: int,
     model_label: str,
+    model_fp16: Optional[torch.nn.Module] = None,
+    target_layer_fp16: Optional[torch.nn.Module] = None,
+    model_fp16_quant: Optional[torch.nn.Module] = None,
+    target_layer_fp16_quant: Optional[torch.nn.Module] = None,
 ) -> None:
     model_fp32.eval()
     model_int8.eval()
@@ -327,6 +326,22 @@ def generate_gradcam_samples(
         use_int8_conv=True,
     )
 
+    cam_fp16 = None
+    if model_fp16 is not None and target_layer_fp16 is not None:
+        model_fp16.eval()
+        cam_fp16 = Int8GradCAM(model_fp16, target_layer_fp16, use_int8_conv=False)
+
+    cam_fp16_quant = None
+    if model_fp16_quant is not None and target_layer_fp16_quant is not None:
+        model_fp16_quant.eval()
+        cam_fp16_quant = Int8GradCAM(
+            model_fp16_quant,
+            target_layer_fp16_quant,
+            model_fp32=model_fp32,
+            target_layer_fp32=target_layer_fp32,
+            use_int8_conv=False,
+        )
+
     model_slug = model_label.lower().replace(" ", "_")
 
     for idx in range(min(num_samples, len(dataset))):
@@ -339,23 +354,47 @@ def generate_gradcam_samples(
         input_tensor = image_tensor.unsqueeze(0)
         original_np = denormalize(image_tensor)
 
-        with torch.enable_grad():
-            heatmap_fp32 = cam_fp32(input_tensor, target_class=imagenet_target, verbose=False)
-        with torch.enable_grad():
-            heatmap_int8 = cam_int8(input_tensor, target_class=imagenet_target, verbose=False)
+        overlays: List[Tuple[str, np.ndarray]] = []
 
-        heatmap_fp32_np = heatmap_fp32.detach().cpu().numpy()[0]
-        heatmap_int8_np = heatmap_int8.detach().cpu().numpy()[0]
+        def _run_cam(cam, base_input, target_class, target_model=None):
+            if cam is None:
+                return None
+            inp = base_input
+            device = None
+            dtype = None
+            if target_model is not None:
+                param = next(target_model.parameters(), None)
+                if param is not None:
+                    device = param.device
+                    dtype = param.dtype if param.is_floating_point() else None
+                else:
+                    buffer = next(target_model.buffers(), None)
+                    if buffer is not None:
+                        device = buffer.device
+                        dtype = buffer.dtype if buffer.is_floating_point() else None
+            if device is not None:
+                inp = inp.to(device)
+            if dtype is not None:
+                inp = inp.to(dtype=dtype)
+            with torch.enable_grad():
+                return cam(inp, target_class=target_class, verbose=False)
+
+        heatmap_fp32 = _run_cam(cam_fp32, input_tensor, imagenet_target, model_fp32)
+        overlays.append((f"{model_label} FP32 GradCAM", heatmap_fp32.detach().cpu().numpy()[0]))
+
+        if cam_fp16 is not None:
+            heatmap_fp16 = _run_cam(cam_fp16, input_tensor, imagenet_target, model_fp16)
+            overlays.append((f"{model_label} FP16 GradCAM", heatmap_fp16.detach().cpu().numpy()[0]))
+
+        if cam_fp16_quant is not None:
+            heatmap_fp16_quant = _run_cam(cam_fp16_quant, input_tensor, imagenet_target, model_fp16_quant)
+            overlays.append((f"{model_label} FP16-Quant GradCAM", heatmap_fp16_quant.detach().cpu().numpy()[0]))
+
+        heatmap_int8 = _run_cam(cam_int8, input_tensor, imagenet_target, model_int8)
+        overlays.append((f"{model_label} INT8 GradCAM", heatmap_int8.detach().cpu().numpy()[0]))
 
         save_path = results_dir / f"{model_slug}_gradcam_sample_{idx:02d}_{wnid}.png"
-        save_gradcam_figure(
-            original_np,
-            heatmap_fp32_np,
-            heatmap_int8_np,
-            fp32_title=f"{model_label} FP32 GradCAM",
-            int8_title=f"{model_label} INT8 GradCAM",
-            save_path=save_path,
-        )
+        save_gradcam_figure(original_np, overlays, save_path=save_path)
 
 
 def main() -> None:
@@ -393,6 +432,18 @@ def main() -> None:
         f"FP32 {model_label} - Top-1: {metrics_fp32['top1']:.2f}% | Top-5: {metrics_fp32['top5']:.2f}% | Samples: {metrics_fp32['samples']:.0f}"
     )
 
+    print(f"Evaluating dynamically quantized FP16 {model_label} model (CPU) ...")
+    model_fp16_quant = torch.quantization.quantize_dynamic(
+        copy.deepcopy(model_fp32),
+        {torch.nn.Linear},
+        dtype=torch.float16,
+    ).eval()
+    target_layer_fp16_quant = model_fp16_quant.layer4[-1]
+    metrics_fp16_quant = evaluate_model(model_fp16_quant, loader, imagenet_indices, folder_to_tiny)
+    print(
+        f"FP16 (quantized) {model_label} - Top-1: {metrics_fp16_quant['top1']:.2f}% | Top-5: {metrics_fp16_quant['top5']:.2f}% | Samples: {metrics_fp16_quant['samples']:.0f}"
+    )
+
     print(f"Loading INT8 quantized {model_label} model (CPU) ...")
     print("Evaluating INT8 model ...")
     metrics_int8 = evaluate_model(model_int8, loader, imagenet_indices, folder_to_tiny)
@@ -400,10 +451,27 @@ def main() -> None:
         f"INT8 {model_label} - Top-1: {metrics_int8['top1']:.2f}% | Top-5: {metrics_int8['top5']:.2f}% | Samples: {metrics_int8['samples']:.0f}"
     )
 
-    delta_top1 = metrics_fp32["top1"] - metrics_int8["top1"]
-    delta_top5 = metrics_fp32["top5"] - metrics_int8["top5"]
+    delta_fp32_int8 = {
+        "top1": metrics_fp32["top1"] - metrics_int8["top1"],
+        "top5": metrics_fp32["top5"] - metrics_int8["top5"],
+    }
+    delta_fp32_fp16q = {
+        "top1": metrics_fp32["top1"] - metrics_fp16_quant["top1"],
+        "top5": metrics_fp32["top5"] - metrics_fp16_quant["top5"],
+    }
+    delta_fp16q_int8 = {
+        "top1": metrics_fp16_quant["top1"] - metrics_int8["top1"],
+        "top5": metrics_fp16_quant["top5"] - metrics_int8["top5"],
+    }
+    print("Performance deltas:")
     print(
-        f"Performance delta (FP32 - INT8): Top-1 Δ={delta_top1:.2f} pts | Top-5 Δ={delta_top5:.2f} pts"
+        f"  FP32 - FP16(quant): Top-1 Δ={delta_fp32_fp16q['top1']:.2f} pts | Top-5 Δ={delta_fp32_fp16q['top5']:.2f} pts"
+    )
+    print(
+        f"  FP32 - INT8:       Top-1 Δ={delta_fp32_int8['top1']:.2f} pts | Top-5 Δ={delta_fp32_int8['top5']:.2f} pts"
+    )
+    print(
+        f"  FP16(quant) - INT8: Top-1 Δ={delta_fp16q_int8['top1']:.2f} pts | Top-5 Δ={delta_fp16q_int8['top5']:.2f} pts"
     )
 
     metrics_path = results_dir / f"tiny_imagenet_{args.model}_metrics.json"
@@ -411,8 +479,13 @@ def main() -> None:
         json.dump(
             {
                 "fp32": metrics_fp32,
+                "fp16_quant": metrics_fp16_quant,
                 "int8": metrics_int8,
-                "delta": {"top1": delta_top1, "top5": delta_top5},
+                "delta": {
+                    "fp32_vs_fp16_quant": delta_fp32_fp16q,
+                    "fp32_vs_int8": delta_fp32_int8,
+                    "fp16_quant_vs_int8": delta_fp16q_int8,
+                },
             },
             f,
             indent=2,
@@ -433,6 +506,8 @@ def main() -> None:
         gradcam_dir,
         num_samples=args.gradcam_samples,
         model_label=model_label,
+        model_fp16_quant=model_fp16_quant,
+        target_layer_fp16_quant=target_layer_fp16_quant,
     )
     print(f"GradCAM images saved to {gradcam_dir}")
 
